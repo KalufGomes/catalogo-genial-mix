@@ -276,6 +276,10 @@ footer{
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M9 15l2 2 4-4"/></svg>
       Conferir PDF
     </button>
+    <button class="btn" id="btnConverterLista">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>
+      Converter em lista
+    </button>
     <button class="btn" id="btnBackup">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       Backup
@@ -394,6 +398,36 @@ footer{
           <div id="pdfNaoEncontrados" style="display:flex;flex-direction:column;gap:8px;"></div>
           <div class="hint" style="margin-top:6px;">Não estão prontos no estoque — vão para a fila de produção, não precisam ser cadastrados.</div>
         </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: converter PDF de etiquetas em lista -->
+<div class="overlay" id="overlayLista">
+  <div class="modal" style="max-width:900px;">
+    <div class="modal-head">
+      <h2>Converter etiquetas em lista</h2>
+      <button class="btn btn-icon btn-ghost" data-close>&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <label class="imgsearch-drop" id="listaDrop">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <div>Envie o PDF de etiquetas</div>
+        <div class="hint" style="margin-top:4px;">Devolve uma lista com Nome, SKU, código do pedido e quantidade (cada SKU aparece uma vez só)</div>
+        <input type="file" accept="application/pdf" id="inputPdfLista">
+      </label>
+      <div id="listaStatus" style="font-size:13px;color:var(--muted);margin-top:10px;"></div>
+      <div id="listaAcoes" style="display:none;margin-top:10px;">
+        <button class="btn btn-primary" id="btnBaixarLista">⬇ Baixar planilha (CSV)</button>
+      </div>
+      <div id="listaTabelaWrap" style="display:none;margin-top:12px;overflow:auto;max-height:55vh;border:1px solid var(--line);border-radius:10px;">
+        <table id="listaTabela" style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead><tr style="text-align:left;color:var(--muted);position:sticky;top:0;background:var(--panel-2);">
+            <th style="padding:8px 10px;">Nome</th><th style="padding:8px 10px;">SKU</th><th style="padding:8px 10px;">Código do pedido</th><th style="padding:8px 10px;text-align:center;">Qtd</th>
+          </tr></thead>
+          <tbody id="listaCorpo"></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -1178,6 +1212,104 @@ async function extrairOcorrenciasDoPdf(file){
   return ocorrencias;
 }
 
+/* ---------- converter PDF de etiquetas em lista ---------- */
+function montarNomeEtiqueta(itens, idxSkuLixo){
+  // itens antes do token "lixo" do código de barras: título (quebrado em linhas) + variação
+  const antes = itens.slice(0, idxSkuLixo);
+  const blocos = [[]];
+  antes.forEach(s => { if (s === '') blocos.push([]); else blocos[blocos.length-1].push(s); });
+  const limpos = blocos.filter(b => b.length)
+    .map(b => b.filter(s => !/^\d{5,7}$/.test(s.trim())).reduce((acc, s) => {
+      if (!acc) return s;
+      const meioDePalavra = /[A-Za-zÀ-ÿ]$/.test(acc) && /^[a-zà-ÿ]/.test(s);
+      return acc + (meioDePalavra ? '' : ' ') + s;
+    }, '').replace(/\s+/g,' ').trim())
+    .filter(Boolean);
+  return limpos.join(' - ');
+}
+async function extrairEtiquetasDetalhadas(pdf){
+  const etiquetas = [];
+  for (let i = 1; i <= pdf.numPages; i++){
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const itens = content.items.map(it => it.str);
+    const tokens = [];
+    itens.forEach((s, idx) => s.split(/\s+/).filter(Boolean).forEach(t => tokens.push({ t, idx })));
+    let sku = null, idxLixo = -1;
+    for (let j = 0; j < tokens.length - 1; j++){
+      if (tokenTemCaractereEstranho(tokens[j].t) && pareceSku(tokens[j+1].t)){
+        sku = tokens[j+1].t; idxLixo = tokens[j].idx; break;
+      }
+    }
+    if (!sku) continue;
+    // código do pedido = primeiro texto depois do SKU (Shopee e Shein têm formatos diferentes)
+    let pedido = '';
+    for (let k = idxLixo + 1; k < itens.length; k++){
+      const t = itens[k].trim();
+      if (!t || t === sku) continue;
+      if (/^[A-Z0-9]{10,20}$/.test(t)) pedido = t;
+      break;
+    }
+    etiquetas.push({ sku, nome: montarNomeEtiqueta(itens, idxLixo), pedido, pageIndex: i - 1 });
+  }
+  return etiquetas;
+}
+function agruparEtiquetasPorSku(etiquetas){
+  const mapa = {};
+  etiquetas.forEach(e => {
+    const g = mapa[e.sku] || (mapa[e.sku] = { sku: e.sku, nome: e.nome, pedidos: [], qtd: 0 });
+    if (!g.nome && e.nome) g.nome = e.nome;
+    if (e.pedido) g.pedidos.push(e.pedido);
+    g.qtd++;
+  });
+  return Object.values(mapa).sort((a,b) => a.sku.localeCompare(b.sku));
+}
+
+let ultimaListaEtiquetas = null;
+function csvCelula(v){
+  const s = String(v == null ? '' : v);
+  return /[";\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+async function converterPdfEmLista(file){
+  const status = document.getElementById('listaStatus');
+  document.getElementById('listaAcoes').style.display = 'none';
+  document.getElementById('listaTabelaWrap').style.display = 'none';
+  ultimaListaEtiquetas = null;
+  status.textContent = 'Lendo o PDF…';
+  try{
+    if (typeof pdfjsLib === 'undefined') throw new Error('Não foi possível carregar o leitor de PDF. Verifique sua conexão com a internet.');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    const etiquetas = await extrairEtiquetasDetalhadas(pdf);
+    if (!etiquetas.length){
+      status.textContent = 'Não consegui identificar nenhuma etiqueta nesse arquivo. Confirme se é o PDF de etiquetas correto.';
+      return;
+    }
+    const lista = agruparEtiquetasPorSku(etiquetas);
+    ultimaListaEtiquetas = { lista, nomeBase: file.name.replace(/\.pdf$/i, '') };
+    document.getElementById('listaCorpo').innerHTML = lista.map(g => `
+      <tr style="border-top:1px solid var(--line);">
+        <td style="padding:8px 10px;">${esc(g.nome)}</td>
+        <td style="padding:8px 10px;white-space:nowrap;font-weight:600;">${esc(g.sku)}</td>
+        <td style="padding:8px 10px;font-size:12px;color:var(--muted);">${esc(g.pedidos.join(', '))}</td>
+        <td style="padding:8px 10px;text-align:center;font-weight:700;color:var(--lime);">${g.qtd}</td>
+      </tr>`).join('');
+    status.textContent = lista.length + ' SKUs diferentes · ' + etiquetas.length + ' etiquetas no total';
+    document.getElementById('listaAcoes').style.display = 'block';
+    document.getElementById('listaTabelaWrap').style.display = 'block';
+  }catch(err){
+    console.error(err);
+    status.textContent = 'Erro ao ler o PDF: ' + (err.message || err);
+  }
+}
+function baixarListaCsv(){
+  if (!ultimaListaEtiquetas) return;
+  const linhas = [['Nome','SKU','Código do pedido','Quantidade']];
+  ultimaListaEtiquetas.lista.forEach(g => linhas.push([g.nome, g.sku, g.pedidos.join(', '), g.qtd]));
+  const csv = '\ufeff' + linhas.map(l => l.map(csvCelula).join(';')).join('\r\n');
+  baixarBytesComoArquivo(new TextEncoder().encode(csv), 'lista-etiquetas-' + ultimaListaEtiquetas.nomeBase + '.csv', 'text/csv;charset=utf-8');
+}
+
 function calcularResultadoPdf(ocorrencias){
   const porSkuPaginas = {}; // sku -> [pageIndex, ...]
   ocorrencias.forEach(o => {
@@ -1327,8 +1459,8 @@ function bytesToDataUrl(bytes, mime){
   return `data:${mime};base64,` + btoa(binary);
 }
 
-function baixarBytesComoArquivo(bytes, filename){
-  const blob = new Blob([bytes], { type: 'application/pdf' });
+function baixarBytesComoArquivo(bytes, filename, mime){
+  const blob = new Blob([bytes], { type: mime || 'application/pdf' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1459,6 +1591,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (file) conferirPdf(file);
     e.target.value = '';
   });
+  document.getElementById('btnConverterLista').addEventListener('click', () => {
+    document.getElementById('listaStatus').textContent = '';
+    document.getElementById('listaAcoes').style.display = 'none';
+    document.getElementById('listaTabelaWrap').style.display = 'none';
+    openOverlay('overlayLista');
+  });
+  document.getElementById('inputPdfLista').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file) converterPdfEmLista(file);
+    e.target.value = '';
+  });
+  document.getElementById('btnBaixarLista').addEventListener('click', baixarListaCsv);
   document.getElementById('btnEnviarSeparacao').addEventListener('click', enviarTudoParaSeparacao);
   document.getElementById('btnBaixarSeparacao').addEventListener('click', baixarPdfSeparacao);
   document.getElementById('btnBaixarProducao').addEventListener('click', baixarPdfProducao);
