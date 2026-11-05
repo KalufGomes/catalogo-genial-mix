@@ -1196,30 +1196,18 @@ async function extrairOcorrenciasDoPdf(file){
 
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-  const ocorrencias = []; // { sku, pageIndex } — pageIndex é 0-based (para o pdf-lib)
-
-  for (let i = 1; i <= pdf.numPages; i++){
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const tokens = content.items.map(it => it.str).join(' ').split(/\s+/).filter(Boolean);
-
-    for (let j = 0; j < tokens.length - 1; j++){
-      if (tokenTemCaractereEstranho(tokens[j]) && pareceSku(tokens[j+1])){
-        ocorrencias.push({ sku: tokens[j+1], pageIndex: i - 1 });
-      }
-    }
-  }
-  return ocorrencias;
+  const todas = await extrairEtiquetasDetalhadas(pdf);
+  // toda página vira uma ocorrência (SKU em código ou texto livre como "Personalizado"); página ilegível vai para produção como "SEM LEITURA"
+  return todas.map(e => ({ sku: e.sku ? e.sku.toUpperCase() : 'SEM LEITURA', pageIndex: e.pageIndex }));
 }
 
 /* ---------- converter PDF de etiquetas em lista ---------- */
-function montarNomeEtiqueta(itens, idxSkuLixo){
-  // itens antes do token "lixo" do código de barras: título (quebrado em linhas) + variação
-  const antes = itens.slice(0, idxSkuLixo);
+function montarNomeEtiqueta(antes){
+  // itens antes do número interno: título (pode vir quebrado em linhas) + variação, separados por item vazio
   const blocos = [[]];
-  antes.forEach(s => { if (s === '') blocos.push([]); else blocos[blocos.length-1].push(s); });
+  antes.forEach(s => { if (s.trim() === '') blocos.push([]); else blocos[blocos.length-1].push(s); });
   const limpos = blocos.filter(b => b.length)
-    .map(b => b.filter(s => !/^\d{5,7}$/.test(s.trim())).reduce((acc, s) => {
+    .map(b => b.reduce((acc, s) => {
       if (!acc) return s;
       const meioDePalavra = /[A-Za-zÀ-ÿ]$/.test(acc) && /^[a-zà-ÿ]/.test(s);
       return acc + (meioDePalavra ? '' : ' ') + s;
@@ -1227,47 +1215,54 @@ function montarNomeEtiqueta(itens, idxSkuLixo){
     .filter(Boolean);
   return limpos.join(' - ');
 }
+function lerEtiquetaDosItens(itens){
+  // estrutura da etiqueta: título, [variação], nº interno (5-7 dígitos), código de barras "lixo", SKU, nº do pedido, marketplace…
+  let idxNum = -1, idxLixo = -1;
+  for (let i = 0; i < itens.length; i++){
+    if (!/^\d{5,7}$/.test(itens[i].trim())) continue;
+    let k = i + 1;
+    while (k < itens.length && !itens[k].trim()) k++;
+    if (k < itens.length && !/\s/.test(itens[k].trim()) && tokenTemCaractereEstranho(itens[k].trim())){ idxNum = i; idxLixo = k; break; }
+  }
+  if (idxNum < 0) return null;
+  const rest = itens.slice(idxLixo + 1).map(s => s.trim()).filter(Boolean);
+  let sku = '', pedido = '';
+  const iPedido = rest.findIndex(s => /^\d{12,}$/.test(s)); // Mercado Livre: pedido só com números
+  if (iPedido >= 0){
+    sku = rest.slice(0, iPedido).join(' ');
+    pedido = rest[iPedido];
+  } else {                                                   // Shopee/Shein: SKU e depois o pedido
+    sku = rest[0] || '';
+    if (rest[1] && /^[A-Z0-9]{10,20}$/.test(rest[1])) pedido = rest[1];
+  }
+  return { sku, pedido, nome: montarNomeEtiqueta(itens.slice(0, idxNum)) };
+}
 async function extrairEtiquetasDetalhadas(pdf){
   const etiquetas = [];
   for (let i = 1; i <= pdf.numPages; i++){
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const itens = content.items.map(it => it.str);
-    const tokens = [];
-    itens.forEach((s, idx) => s.split(/\s+/).filter(Boolean).forEach(t => tokens.push({ t, idx })));
-    let sku = null, idxLixo = -1;
-    for (let j = 0; j < tokens.length - 1; j++){
-      if (tokenTemCaractereEstranho(tokens[j].t) && pareceSku(tokens[j+1].t)){
-        sku = tokens[j+1].t; idxLixo = tokens[j].idx; break;
-      }
-    }
-    if (!sku) continue;
-    // código do pedido = primeiro texto depois do SKU (Shopee e Shein têm formatos diferentes)
-    let pedido = '';
-    for (let k = idxLixo + 1; k < itens.length; k++){
-      const t = itens[k].trim();
-      if (!t || t === sku) continue;
-      if (/^[A-Z0-9]{10,20}$/.test(t)) pedido = t;
-      break;
-    }
-    etiquetas.push({ sku, nome: montarNomeEtiqueta(itens, idxLixo), pedido, pageIndex: i - 1 });
+    const e = lerEtiquetaDosItens(content.items.map(it => it.str));
+    etiquetas.push(e && e.sku ? { ...e, pageIndex: i - 1 } : { sku: '', pedido: '', nome: '', pageIndex: i - 1 });
   }
   return etiquetas;
 }
+function skuParecePadrao(sku){ return /^[A-Za-z0-9]{4,20}$/.test(sku) && /\d/.test(sku); }
 function agruparEtiquetasPorSku(etiquetas){
   const mapa = {};
-  etiquetas.forEach(e => {
-    const g = mapa[e.sku] || (mapa[e.sku] = { sku: e.sku, nome: e.nome, pedidos: [], qtd: 0 });
-    if (!g.nome && e.nome) g.nome = e.nome;
-    if (e.pedido) g.pedidos.push(e.pedido);
+  etiquetas.filter(e => e.sku).forEach(e => {
+    // SKU em código agrupa só pelo código; texto livre ("Personalizado", "Arte do cliente"…) agrupa também pelo nome do anúncio
+    const chave = skuParecePadrao(e.sku) ? e.sku.toUpperCase() : e.sku.toUpperCase() + '|' + e.nome;
+    const g = mapa[chave] || (mapa[chave] = { sku: e.sku, nome: e.nome, pedidos: [], qtd: 0 });
+    if (e.pedido && !g.pedidos.includes(e.pedido)) g.pedidos.push(e.pedido);
     g.qtd++;
   });
-  return Object.values(mapa).sort((a,b) => a.sku.localeCompare(b.sku));
+  return Object.values(mapa).sort((a,b) => a.sku.localeCompare(b.sku) || a.nome.localeCompare(b.nome));
 }
-
 let ultimaListaEtiquetas = null;
-function csvCelula(v){
-  const s = String(v == null ? '' : v);
+function csvCelula(v, comoTexto){
+  let s = String(v == null ? '' : v);
+  if (comoTexto && /^\d{9,}$/.test(s)) s = '="' + s + '"'; // evita o Excel mostrar 2,00002E+15
   return /[";\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 async function converterPdfEmLista(file){
@@ -1280,7 +1275,9 @@ async function converterPdfEmLista(file){
     if (typeof pdfjsLib === 'undefined') throw new Error('Não foi possível carregar o leitor de PDF. Verifique sua conexão com a internet.');
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
-    const etiquetas = await extrairEtiquetasDetalhadas(pdf);
+    const todas = await extrairEtiquetasDetalhadas(pdf);
+    const etiquetas = todas.filter(e => e.sku);
+    const naoLidas = todas.length - etiquetas.length;
     if (!etiquetas.length){
       status.textContent = 'Não consegui identificar nenhuma etiqueta nesse arquivo. Confirme se é o PDF de etiquetas correto.';
       return;
@@ -1294,7 +1291,7 @@ async function converterPdfEmLista(file){
         <td style="padding:8px 10px;font-size:12px;color:var(--muted);">${esc(g.pedidos.join(', '))}</td>
         <td style="padding:8px 10px;text-align:center;font-weight:700;color:var(--lime);">${g.qtd}</td>
       </tr>`).join('');
-    status.textContent = lista.length + ' SKUs diferentes · ' + etiquetas.length + ' etiquetas no total';
+    status.textContent = lista.length + ' linhas · ' + etiquetas.length + ' etiquetas no total' + (naoLidas ? ' · ⚠ ' + naoLidas + ' página(s) do PDF não puderam ser lidas' : '');
     document.getElementById('listaAcoes').style.display = 'block';
     document.getElementById('listaTabelaWrap').style.display = 'block';
   }catch(err){
@@ -1306,7 +1303,7 @@ function baixarListaCsv(){
   if (!ultimaListaEtiquetas) return;
   const linhas = [['Nome','SKU','Código do pedido','Quantidade']];
   ultimaListaEtiquetas.lista.forEach(g => linhas.push([g.nome, g.sku, g.pedidos.join(', '), g.qtd]));
-  const csv = '\ufeff' + linhas.map(l => l.map(csvCelula).join(';')).join('\r\n');
+  const csv = '\ufeff' + linhas.map(l => l.map((c, i) => csvCelula(c, i === 2)).join(';')).join('\r\n');
   baixarBytesComoArquivo(new TextEncoder().encode(csv), 'lista-etiquetas-' + ultimaListaEtiquetas.nomeBase + '.csv', 'text/csv;charset=utf-8');
 }
 
